@@ -1,98 +1,180 @@
-- 
-
 # sing-box Argo Lite
 
-面向无 root、低内存 NAT 小机的 VLESS + WebSocket + TLS 一键脚本。
+适用于无 root、低内存 NAT 小机的 VLESS + WebSocket + TLS 一键部署脚本。
 
-## 工作方式
-
-```text
-客户端
-  -> trycloudflare.com:443
-  -> Cloudflare TLS / Quick Tunnel
-  -> 127.0.0.1:40001
-  -> sing-box VLESS WebSocket
-```
-
-TLS 在 Cloudflare 边缘终止，本机 sing-box 不配置证书。
+脚本使用 Cloudflare Quick Tunnel 自动生成临时 `trycloudflare.com` 域名，不需要自己的域名、TLS 证书、Nginx 或 systemd。
 
 ## 一键安装
 
-将 `USER` 和 `REPO` 替换为自己的 GitHub 用户名和仓库名：
+推荐使用下面的命令。命令中的 `tr` 可以兼容意外出现的 Windows CRLF 换行：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh)
+wget -qO- https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh | tr -d '\r' | bash
 ```
 
-没有 `wget` 时：
+也可以分行执行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh)
+wget -qO- \
+  https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh \
+  | tr -d '\r' \
+  | bash
 ```
 
-使用配置文件：
+确认 GitHub 上的 `install.sh` 已经使用 Linux LF 换行后，也可以使用：
 
 ```bash
-wget -qO config.conf \
-  https://raw.githubusercontent.com/USER/REPO/main/config.conf.example
-
 bash <(wget -qO- \
-  https://raw.githubusercontent.com/USER/REPO/main/install.sh) \
-  -f config.conf
+  https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh)
 ```
 
-## 在线订阅
+安装成功后，脚本会自动输出一个完整的 `vless://` 节点链接。
 
-在线订阅使用 GitHub Gist，不额外运行 Web、Nginx 或订阅进程。
+## 查看节点
 
-首次安装会询问 GitHub Token。Token 需要 `gist` 权限，并只保存在：
-
-```text
-~/.config/sb-argo/secrets.conf
-```
-
-不要把 Token 提交到 GitHub。
-
-临时 Argo 域名改变后，脚本会更新同一个 Gist，因此订阅 URL 保持不变。GitHub Raw 缓存可能导致更新延迟数分钟。
-
-## 管理命令
-
-```bash
-sb-argo show
-sb-argo status
-sb-argo restart
-sb-argo logs
-sb-argo stop
-sb-argo update
-sb-argo uninstall
-```
-
-如果 `~/.local/bin` 不在 PATH：
+执行：
 
 ```bash
 ~/.local/bin/sb-argo show
 ```
 
-## 本地订阅文件
+复制输出中完整的 `vless://` 链接，在 v2rayN 中选择：
 
-无论是否启用 Gist，Base64 订阅都会生成到：
+```text
+服务器 -> 从剪贴板导入批量 URL
+```
+
+正确生成的节点应包含：
+
+```text
+协议：VLESS
+端口：443
+传输：WebSocket
+TLS：开启
+地址：随机域名.trycloudflare.com
+Host：随机域名.trycloudflare.com
+SNI：随机域名.trycloudflare.com
+```
+
+## 管理命令
+
+查看节点：
+
+```bash
+~/.local/bin/sb-argo show
+```
+
+查看运行状态：
+
+```bash
+~/.local/bin/sb-argo status
+```
+
+重新启动并生成新的 Cloudflare 临时域名：
+
+```bash
+~/.local/bin/sb-argo restart
+```
+
+查看运行日志：
+
+```bash
+~/.local/bin/sb-argo logs
+```
+
+停止 sing-box 和 Cloudflare 隧道：
+
+```bash
+~/.local/bin/sb-argo stop
+```
+
+更新 sing-box、cloudflared 和管理脚本：
+
+```bash
+~/.local/bin/sb-argo update
+```
+
+重新生成 UUID、WebSocket 路径和节点：
+
+```bash
+~/.local/bin/sb-argo rotate
+```
+
+彻底卸载：
+
+```bash
+~/.local/bin/sb-argo uninstall
+```
+
+## 工作方式
+
+```text
+v2rayN
+  -> trycloudflare.com:443
+  -> Cloudflare Quick Tunnel
+  -> 127.0.0.1:40001
+  -> sing-box VLESS WebSocket
+```
+
+TLS 由 Cloudflare 提供，本机不需要配置域名和证书。
+
+客户端连接临时域名的 `443` 端口，不需要填写 NAT 小机映射的 `40001` 端口。
+
+## 订阅文件
+
+脚本会在服务器本地生成 Base64 订阅文件：
 
 ```text
 ~/.local/share/sb-argo/state/subscription.txt
 ```
 
-节点详情位于：
+查看本地订阅内容：
 
-```text
-~/.local/share/sb-argo/state/node-info.txt
+```bash
+cat ~/.local/share/sb-argo/state/subscription.txt
 ```
 
-## 限制
+当前精简版本不提供在线订阅 URL，避免额外运行订阅服务或保存 GitHub Token。
 
-- Quick Tunnel 重启后会更换 `trycloudflare.com` 域名。
-- Gist 订阅需要 GitHub Token 才能自动更新。
-- `@reboot` 是否生效取决于服务商是否运行用户 crontab。
-- 某些主机会在 SSH 退出后清理用户进程，此时 `nohup` 无法保活。
-- 64 MB 同时运行 sing-box 和 cloudflared 仍可能触发 OOM。
-- `GOMEMLIMIT` 只限制 Go 堆目标，不是 RSS 硬限制。
-- NAT 映射的 `40001` 不直接提供给客户端；客户端连接临时域名的 `443`。
+## 注意事项
+
+- Cloudflare Quick Tunnel 的临时域名在隧道重新启动后通常会改变。
+- 执行 `restart` 后，需要重新运行 `show` 并导入新的节点链接。
+- 执行 `rotate` 会同时更换 UUID、WebSocket 路径和临时域名。
+- 不要在客户端开启“跳过证书验证”，Cloudflare 提供的是可信 TLS 证书。
+- 64 MB 内存非常有限，脚本已经对 sing-box 和 cloudflared 设置了低内存运行参数。
+- 部分服务商会在 SSH 断开后清理普通用户进程，这种环境下 `nohup` 可能无法长期保活。
+- 用户 `crontab` 是否支持开机启动取决于服务商环境。
+
+## 查看故障日志
+
+如果节点无法连接，先检查运行状态：
+
+```bash
+~/.local/bin/sb-argo status
+```
+
+然后查看日志：
+
+```bash
+~/.local/bin/sb-argo logs
+```
+
+正常情况下应显示：
+
+```text
+sing-box:    running
+cloudflared: running
+```
+
+生成的节点链接必须包含临时域名：
+
+```text
+vless://UUID@随机域名.trycloudflare.com:443
+```
+
+如果链接中出现下面这种空地址，则节点无效：
+
+```text
+vless://UUID@:443
+```
