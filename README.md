@@ -21,13 +21,13 @@ TLS 在 Cloudflare 边缘终止，本机 sing-box 不配置证书。
 将 `USER` 和 `REPO` 替换为自己的 GitHub 用户名和仓库名：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/USER/REPO/main/install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh)
 ```
 
 没有 `wget` 时：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh)
 ```
 
 使用配置文件：
