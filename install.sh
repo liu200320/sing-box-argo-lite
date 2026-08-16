@@ -1,5 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/sh
 set -u
+
+export LC_ALL=C
+export LANG=C
 
 SELF_URL="${SELF_URL:-https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh}"
 
@@ -19,6 +22,7 @@ CF_PID_FILE="${STATE_DIR}/cloudflared.pid"
 UUID_FILE="${CONFIG_DIR}/uuid"
 WS_PATH_FILE="${CONFIG_DIR}/ws-path"
 PORT_FILE="${CONFIG_DIR}/local-port"
+
 DOMAIN_FILE="${STATE_DIR}/domain"
 NODE_FILE="${STATE_DIR}/node-info.txt"
 SUB_FILE="${STATE_DIR}/subscription.txt"
@@ -30,9 +34,11 @@ ACTION="${1:-install}"
 
 LOCAL_PORT="${LOCAL_PORT:-}"
 NODE_NAME="${NODE_NAME:-NAT-Argo-VLESS-WS-TLS}"
+
 SB_VERSION="${SB_VERSION:-1.13.18}"
 SB_MEMORY="${SB_MEMORY:-18MiB}"
 CF_MEMORY="${CF_MEMORY:-24MiB}"
+
 ENABLE_CRON="${ENABLE_CRON:-true}"
 GH_PROXY="${GH_PROXY:-}"
 
@@ -58,6 +64,13 @@ usage() {
   sb-argo update
   sb-argo rotate
   sb-argo uninstall
+
+环境变量:
+  LOCAL_PORT=40001
+  NODE_NAME=NAT-Argo-VLESS-WS-TLS
+  SB_MEMORY=18MiB
+  CF_MEMORY=24MiB
+  SB_VERSION=1.13.18
 EOF
 }
 
@@ -84,26 +97,26 @@ mkdir -p \
 chmod 700 "$APP_DIR" "$CONFIG_DIR"
 
 download_file() {
-  local url="$1"
-  local output="$2"
-  local temp="${output}.download"
+  DL_URL="$1"
+  DL_OUTPUT="$2"
+  DL_TEMP="${DL_OUTPUT}.download"
 
-  case "$url" in
+  case "$DL_URL" in
     https://github.com/*|https://raw.githubusercontent.com/*)
-      url="${GH_PROXY}${url}"
+      DL_URL="${GH_PROXY}${DL_URL}"
       ;;
   esac
 
-  rm -f "$temp"
+  rm -f "$DL_TEMP"
 
-  # 64 MB 机器优先使用 wget，避免 curl 下载时出现较高内存峰值。
+  # 低内存环境优先使用 wget。
   if command -v wget >/dev/null 2>&1; then
     wget -q \
-      --tries=10 \
-      --timeout=30 \
-      -O "$temp" \
-      "$url" || {
-        rm -f "$temp"
+      -T 30 \
+      -t 10 \
+      -O "$DL_TEMP" \
+      "$DL_URL" || {
+        rm -f "$DL_TEMP"
         return 1
       }
   elif command -v curl >/dev/null 2>&1; then
@@ -111,21 +124,21 @@ download_file() {
       --retry 10 \
       --retry-delay 2 \
       --connect-timeout 20 \
-      -o "$temp" \
-      "$url" || {
-        rm -f "$temp"
+      -o "$DL_TEMP" \
+      "$DL_URL" || {
+        rm -f "$DL_TEMP"
         return 1
       }
   else
     die "系统中没有 wget 或 curl"
   fi
 
-  [ -s "$temp" ] || {
-    rm -f "$temp"
+  if [ ! -s "$DL_TEMP" ]; then
+    rm -f "$DL_TEMP"
     return 1
-  }
+  fi
 
-  mv "$temp" "$output"
+  mv "$DL_TEMP" "$DL_OUTPUT"
 }
 
 detect_arch() {
@@ -151,65 +164,64 @@ detect_arch() {
       ;;
   esac
 }
+
 choose_local_port() {
-  local saved_port=""
-  local input_port=""
-  local default_port="40001"
+  PORT_DEFAULT="40001"
+  PORT_SAVED=""
+  PORT_INPUT=""
 
   if [ -s "$PORT_FILE" ]; then
-    saved_port="$(head -n 1 "$PORT_FILE" | tr -d '\r\n')"
+    PORT_SAVED="$(
+      head -n 1 "$PORT_FILE" 2>/dev/null |
+        tr -d '\r\n'
+    )"
 
-    case "$saved_port" in
+    case "$PORT_SAVED" in
       ''|*[!0-9]*)
-        saved_port=""
+        PORT_SAVED=""
         ;;
     esac
   fi
 
-  if [ -n "$saved_port" ]; then
-    default_port="$saved_port"
+  if [ -n "$PORT_SAVED" ]; then
+    PORT_DEFAULT="$PORT_SAVED"
   fi
 
-  # 环境变量优先，例如：LOCAL_PORT=40002 bash install.sh
+  # 环境变量的优先级最高。
   if [ -n "$LOCAL_PORT" ]; then
     return 0
   fi
 
-  # 只在首次安装或重新安装时询问。
-  # 使用 /dev/tty，因此 wget | tr | bash 的运行方式也可以交互。
-  if [ "$ACTION" = "install" ] &&
-     [ -t 1 ] &&
-     [ -r /dev/tty ]; then
+  # 只有 install 操作交互询问。
+  # 从管道执行时，使用 /dev/tty 读取用户输入。
+  if [ "$ACTION" = "install" ] && [ -c /dev/tty ]; then
     printf '请输入 sing-box 本地回源端口 [默认 %s]: ' \
-      "$default_port" >/dev/tty
+      "$PORT_DEFAULT" >/dev/tty
 
-    if ! IFS= read -r input_port </dev/tty; then
-      input_port=""
+    if ! IFS= read -r PORT_INPUT </dev/tty; then
+      PORT_INPUT=""
     fi
 
-    LOCAL_PORT="${input_port:-$default_port}"
+    LOCAL_PORT="${PORT_INPUT:-$PORT_DEFAULT}"
   else
-    LOCAL_PORT="$default_port"
+    LOCAL_PORT="$PORT_DEFAULT"
   fi
 }
 
-save_local_port() {
-  printf '%s\n' "$LOCAL_PORT" >"$PORT_FILE"
-  chmod 600 "$PORT_FILE"
-}
 validate_settings() {
   case "$LOCAL_PORT" in
     ''|*[!0-9]*)
-      die "LOCAL_PORT 必须是数字"
+      die "端口必须是数字"
       ;;
   esac
 
-  if [ "$LOCAL_PORT" -lt 1024 ] || [ "$LOCAL_PORT" -gt 65535 ]; then
-    die "LOCAL_PORT 必须在 1024 到 65535 之间"
+  if [ "$LOCAL_PORT" -lt 1024 ] ||
+     [ "$LOCAL_PORT" -gt 65535 ]; then
+    die "端口必须在 1024 到 65535 之间"
   fi
 
   case "$NODE_NAME" in
-    *[!A-Za-z0-9._-]*)
+    ''|*[!A-Za-z0-9._-]*)
       die "NODE_NAME 只能包含字母、数字、点、下划线和短横线"
       ;;
   esac
@@ -223,56 +235,60 @@ validate_settings() {
   esac
 }
 
+save_local_port() {
+  printf '%s\n' "$LOCAL_PORT" >"$PORT_FILE"
+  chmod 600 "$PORT_FILE"
+}
+
 pid_running() {
-  local pid_file="$1"
-  local expected_bin="$2"
-  local pid
+  PID_FILE_ARG="$1"
+  EXPECTED_BIN_ARG="$2"
 
-  [ -s "$pid_file" ] || return 1
+  [ -s "$PID_FILE_ARG" ] || return 1
 
-  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  PID_VALUE="$(cat "$PID_FILE_ARG" 2>/dev/null || true)"
 
-  case "$pid" in
+  case "$PID_VALUE" in
     ''|*[!0-9]*)
       return 1
       ;;
   esac
 
-  kill -0 "$pid" 2>/dev/null || return 1
+  kill -0 "$PID_VALUE" 2>/dev/null || return 1
 
-  if [ -r "/proc/${pid}/cmdline" ]; then
-    tr '\000' ' ' <"/proc/${pid}/cmdline" |
-      grep -Fq "$expected_bin" || return 1
+  if [ -r "/proc/${PID_VALUE}/cmdline" ]; then
+    tr '\000' ' ' <"/proc/${PID_VALUE}/cmdline" |
+      grep -Fq "$EXPECTED_BIN_ARG" || return 1
   fi
 
   return 0
 }
 
 stop_process() {
-  local pid_file="$1"
-  local expected_bin="$2"
-  local pid
-  local count
+  STOP_PID_FILE="$1"
+  STOP_EXPECTED_BIN="$2"
 
-  if ! pid_running "$pid_file" "$expected_bin"; then
-    rm -f "$pid_file"
+  if ! pid_running "$STOP_PID_FILE" "$STOP_EXPECTED_BIN"; then
+    rm -f "$STOP_PID_FILE"
     return 0
   fi
 
-  pid="$(cat "$pid_file")"
-  kill "$pid" 2>/dev/null || true
+  STOP_PID="$(cat "$STOP_PID_FILE")"
+  kill "$STOP_PID" 2>/dev/null || true
 
-  count=0
-  while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 8 ]; do
+  STOP_COUNT=0
+
+  while kill -0 "$STOP_PID" 2>/dev/null &&
+        [ "$STOP_COUNT" -lt 8 ]; do
     sleep 1
-    count=$((count + 1))
+    STOP_COUNT=$((STOP_COUNT + 1))
   done
 
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -9 "$pid" 2>/dev/null || true
+  if kill -0 "$STOP_PID" 2>/dev/null; then
+    kill -9 "$STOP_PID" 2>/dev/null || true
   fi
 
-  rm -f "$pid_file"
+  rm -f "$STOP_PID_FILE"
 }
 
 stop_all() {
@@ -295,80 +311,81 @@ show_status() {
 }
 
 install_manager() {
-  local downloaded="${STATE_DIR}/manager-source"
-  local cleaned="${MANAGER}.new"
+  MANAGER_SOURCE="${STATE_DIR}/manager-source"
+  MANAGER_NEW="${MANAGER}.new"
 
   say "正在安装管理命令..."
 
-  download_file "$SELF_URL" "$downloaded" ||
+  download_file "$SELF_URL" "$MANAGER_SOURCE" ||
     die "无法从 GitHub 下载管理脚本"
 
-  # 即使 GitHub 文件意外使用 CRLF，服务器上的管理脚本仍转换为 LF。
-  tr -d '\r' <"$downloaded" >"$cleaned"
+  # 自动清除 GitHub 文件中可能存在的 CRLF。
+  tr -d '\r' <"$MANAGER_SOURCE" >"$MANAGER_NEW"
 
-  chmod 700 "$cleaned"
-  mv "$cleaned" "$MANAGER"
-  rm -f "$downloaded"
+  chmod 700 "$MANAGER_NEW"
+  mv "$MANAGER_NEW" "$MANAGER"
+  rm -f "$MANAGER_SOURCE"
 }
 
 download_sing_box() {
-  local force="$1"
-  local package
-  local archive
-  local new_bin="${SB_BIN}.new"
+  DOWNLOAD_FORCE="$1"
 
-  if [ "$force" != "true" ] && [ -x "$SB_BIN" ]; then
+  if [ "$DOWNLOAD_FORCE" != "true" ] &&
+     [ -x "$SB_BIN" ]; then
     return 0
   fi
 
-  package="sing-box-${SB_VERSION}-linux-${SB_ARCH}.tar.gz"
-  archive="${STATE_DIR}/${package}"
+  SB_PACKAGE="sing-box-${SB_VERSION}-linux-${SB_ARCH}.tar.gz"
+  SB_ARCHIVE="${STATE_DIR}/${SB_PACKAGE}"
+  SB_NEW="${SB_BIN}.new"
 
   say "正在下载 sing-box ${SB_VERSION}..."
 
   download_file \
-    "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/${package}" \
-    "$archive" ||
+    "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/${SB_PACKAGE}" \
+    "$SB_ARCHIVE" ||
     die "sing-box 下载失败"
 
-  rm -f "$new_bin"
+  rm -f "$SB_NEW"
 
   tar -xOzf \
-    "$archive" \
+    "$SB_ARCHIVE" \
     "sing-box-${SB_VERSION}-linux-${SB_ARCH}/sing-box" \
-    >"$new_bin" || {
-      rm -f "$new_bin"
+    >"$SB_NEW" || {
+      rm -f "$SB_NEW"
       die "sing-box 解压失败"
     }
 
-  chmod 700 "$new_bin"
-  mv "$new_bin" "$SB_BIN"
-  rm -f "$archive"
+  chmod 700 "$SB_NEW"
+  mv "$SB_NEW" "$SB_BIN"
+  rm -f "$SB_ARCHIVE"
 
   "$SB_BIN" version >/dev/null 2>&1 ||
-    die "sing-box 二进制无法运行"
+    die "sing-box 二进制无法运行，可能与当前系统不兼容"
 }
 
 download_cloudflared() {
-  local force="$1"
-  local new_bin="${CF_BIN}.new"
+  DOWNLOAD_FORCE="$1"
 
-  if [ "$force" != "true" ] && [ -x "$CF_BIN" ]; then
+  if [ "$DOWNLOAD_FORCE" != "true" ] &&
+     [ -x "$CF_BIN" ]; then
     return 0
   fi
+
+  CF_NEW="${CF_BIN}.new"
 
   say "正在下载 cloudflared..."
 
   download_file \
     "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" \
-    "$new_bin" ||
-    die "cloudflared 下载失败，可能是内存不足或网络中断"
+    "$CF_NEW" ||
+    die "cloudflared 下载失败，可能是网络中断或内存不足"
 
-  chmod 700 "$new_bin"
-  mv "$new_bin" "$CF_BIN"
+  chmod 700 "$CF_NEW"
+  mv "$CF_NEW" "$CF_BIN"
 
   "$CF_BIN" --version >/dev/null 2>&1 ||
-    die "cloudflared 二进制无法运行"
+    die "cloudflared 二进制无法运行，可能与当前系统不兼容"
 }
 
 create_identity() {
@@ -386,7 +403,7 @@ create_identity() {
   WS_PATH="$(cat "$WS_PATH_FILE")"
 
   case "$UUID" in
-    *[!0-9A-Fa-f-]*|'')
+    ''|*[!0-9A-Fa-f-]*)
       die "保存的 UUID 无效"
       ;;
   esac
@@ -395,7 +412,7 @@ create_identity() {
     /*)
       ;;
     *)
-      die "WS 路径必须以 / 开头"
+      die "WebSocket 路径必须以 / 开头"
       ;;
   esac
 
@@ -489,30 +506,30 @@ start_cloudflared() {
 }
 
 wait_for_domain() {
-  local domain=""
-  local count=0
+  DOMAIN_CANDIDATE=""
+  DOMAIN_COUNT=0
 
-  while [ "$count" -lt 120 ]; do
+  while [ "$DOMAIN_COUNT" -lt 120 ]; do
     if ! pid_running "$CF_PID_FILE" "$CF_BIN"; then
       return 1
     fi
 
-    domain="$(
-      grep -aoE \
+    DOMAIN_CANDIDATE="$(
+      grep -Eo \
         'https://[A-Za-z0-9-]+\.trycloudflare\.com' \
         "$CF_LOG" 2>/dev/null |
         tail -n 1 |
         sed 's#https://##'
     )"
 
-    case "$domain" in
+    case "$DOMAIN_CANDIDATE" in
       *.trycloudflare.com)
-        printf '%s' "$domain"
+        printf '%s' "$DOMAIN_CANDIDATE"
         return 0
         ;;
     esac
 
-    count=$((count + 1))
+    DOMAIN_COUNT=$((DOMAIN_COUNT + 1))
     sleep 1
   done
 
@@ -520,25 +537,23 @@ wait_for_domain() {
 }
 
 create_node() {
-  local domain="$1"
-  local encoded_path
-  local link
+  NODE_DOMAIN="$1"
 
-  case "$domain" in
+  case "$NODE_DOMAIN" in
     *.trycloudflare.com)
       ;;
     *)
-      die "拒绝使用空域名或无效临时域名生成节点"
+      die "拒绝使用空域名或无效域名生成节点"
       ;;
   esac
 
-  encoded_path="%2F${WS_PATH#/}"
+  ENCODED_PATH="%2F${WS_PATH#/}"
 
-  link="vless://${UUID}@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=${encoded_path}#${NODE_NAME}"
+  VLESS_LINK="vless://${UUID}@${NODE_DOMAIN}:443?encryption=none&security=tls&sni=${NODE_DOMAIN}&alpn=http%2F1.1&type=ws&host=${NODE_DOMAIN}&path=${ENCODED_PATH}#${NODE_NAME}"
 
-  printf '%s\n' "$domain" >"$DOMAIN_FILE"
+  printf '%s\n' "$NODE_DOMAIN" >"$DOMAIN_FILE"
 
-  printf '%s\n' "$link" |
+  printf '%s\n' "$VLESS_LINK" |
     base64 |
     tr -d '\r\n' >"$SUB_FILE"
 
@@ -546,17 +561,18 @@ create_node() {
 
   cat >"$NODE_FILE" <<EOF
 协议: VLESS
-地址: ${domain}
+地址: ${NODE_DOMAIN}
 端口: 443
 UUID: ${UUID}
 传输: WebSocket
 路径: ${WS_PATH}
-Host: ${domain}
+Host: ${NODE_DOMAIN}
 TLS: 开启
-SNI: ${domain}
+SNI: ${NODE_DOMAIN}
+本地回源端口: ${LOCAL_PORT}
 
 节点链接:
-${link}
+${VLESS_LINK}
 
 本地 Base64 订阅文件:
 ${SUB_FILE}
@@ -575,17 +591,15 @@ remove_cron() {
 }
 
 add_cron() {
-  local cron_line
-
   [ "$ENABLE_CRON" = "true" ] || return 0
   command -v crontab >/dev/null 2>&1 || return 0
 
-  cron_line="@reboot sleep 20 && ${MANAGER} start >>${LOG_DIR}/boot.log 2>&1"
+  CRON_LINE="@reboot sleep 20 && ${MANAGER} start >>${LOG_DIR}/boot.log 2>&1"
 
   {
     crontab -l 2>/dev/null |
       grep -Fv "${MANAGER} start" || true
-    printf '%s\n' "$cron_line"
+    printf '%s\n' "$CRON_LINE"
   } | crontab - 2>/dev/null || true
 }
 
@@ -625,20 +639,27 @@ case "$ACTION" in
 esac
 
 command -v tar >/dev/null 2>&1 ||
-  die "服务器缺少 tar 命令"
+  die "系统缺少 tar 命令"
 
 command -v base64 >/dev/null 2>&1 ||
-  die "服务器缺少 base64 命令"
+  die "系统缺少 base64 命令"
+
+command -v grep >/dev/null 2>&1 ||
+  die "系统缺少 grep 命令"
+
+command -v sed >/dev/null 2>&1 ||
+  die "系统缺少 sed 命令"
 
 command -v tr >/dev/null 2>&1 ||
-  die "服务器缺少 tr 命令"
+  die "系统缺少 tr 命令"
 
 choose_local_port
 validate_settings
 save_local_port
 detect_arch
 
-if [ "$ACTION" = "install" ] || [ "$ACTION" = "update" ]; then
+if [ "$ACTION" = "install" ] ||
+   [ "$ACTION" = "update" ]; then
   install_manager
 fi
 
@@ -663,7 +684,11 @@ if [ "$ACTION" = "start" ] &&
    pid_running "$SB_PID_FILE" "$SB_BIN" &&
    pid_running "$CF_PID_FILE" "$CF_BIN"; then
   show_status
-  [ -s "$NODE_FILE" ] && cat "$NODE_FILE"
+
+  if [ -s "$NODE_FILE" ]; then
+    cat "$NODE_FILE"
+  fi
+
   exit 0
 fi
 
