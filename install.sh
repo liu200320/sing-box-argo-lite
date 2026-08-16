@@ -1,6 +1,7 @@
 #!/bin/sh
 set -u
 
+# 使用基础 C locale，避免精简系统缺少 zh_CN.UTF-8。
 export LC_ALL=C
 export LANG=C
 
@@ -38,7 +39,6 @@ NODE_NAME="${NODE_NAME:-NAT-Argo-VLESS-WS-TLS}"
 SB_VERSION="${SB_VERSION:-1.13.18}"
 SB_MEMORY="${SB_MEMORY:-18MiB}"
 CF_MEMORY="${CF_MEMORY:-24MiB}"
-
 ENABLE_CRON="${ENABLE_CRON:-true}"
 GH_PROXY="${GH_PROXY:-}"
 
@@ -65,12 +65,12 @@ usage() {
   sb-argo rotate
   sb-argo uninstall
 
-环境变量:
+可用环境变量:
   LOCAL_PORT=40001
   NODE_NAME=NAT-Argo-VLESS-WS-TLS
+  SB_VERSION=1.13.18
   SB_MEMORY=18MiB
   CF_MEMORY=24MiB
-  SB_VERSION=1.13.18
 EOF
 }
 
@@ -109,7 +109,7 @@ download_file() {
 
   rm -f "$DL_TEMP"
 
-  # 低内存环境优先使用 wget。
+  # 极低内存环境优先使用 wget。
   if command -v wget >/dev/null 2>&1; then
     wget -q \
       -T 30 \
@@ -187,14 +187,15 @@ choose_local_port() {
     PORT_DEFAULT="$PORT_SAVED"
   fi
 
-  # 环境变量的优先级最高。
+  # 环境变量优先。
   if [ -n "$LOCAL_PORT" ]; then
     return 0
   fi
 
-  # 只有 install 操作交互询问。
-  # 从管道执行时，使用 /dev/tty 读取用户输入。
-  if [ "$ACTION" = "install" ] && [ -c /dev/tty ]; then
+  # 首次安装时通过 /dev/tty 交互读取，支持 wget | sh。
+  if [ "$ACTION" = "install" ] &&
+     [ -r /dev/tty ] &&
+     [ -w /dev/tty ]; then
     printf '请输入 sing-box 本地回源端口 [默认 %s]: ' \
       "$PORT_DEFAULT" >/dev/tty
 
@@ -217,7 +218,7 @@ validate_settings() {
 
   if [ "$LOCAL_PORT" -lt 1024 ] ||
      [ "$LOCAL_PORT" -gt 65535 ]; then
-    die "端口必须在 1024 到 65535 之间"
+    die "普通用户端口必须在 1024 到 65535 之间"
   fi
 
   case "$NODE_NAME" in
@@ -240,9 +241,8 @@ save_local_port() {
   chmod 600 "$PORT_FILE"
 }
 
-pid_running() {
+pid_alive() {
   PID_FILE_ARG="$1"
-  EXPECTED_BIN_ARG="$2"
 
   [ -s "$PID_FILE_ARG" ] || return 1
 
@@ -254,26 +254,39 @@ pid_running() {
       ;;
   esac
 
-  kill -0 "$PID_VALUE" 2>/dev/null || return 1
-
-  if [ -r "/proc/${PID_VALUE}/cmdline" ]; then
-    tr '\000' ' ' <"/proc/${PID_VALUE}/cmdline" |
-      grep -Fq "$EXPECTED_BIN_ARG" || return 1
-  fi
-
-  return 0
+  kill -0 "$PID_VALUE" 2>/dev/null
 }
 
 stop_process() {
   STOP_PID_FILE="$1"
   STOP_EXPECTED_BIN="$2"
 
-  if ! pid_running "$STOP_PID_FILE" "$STOP_EXPECTED_BIN"; then
+  if ! pid_alive "$STOP_PID_FILE"; then
     rm -f "$STOP_PID_FILE"
     return 0
   fi
 
   STOP_PID="$(cat "$STOP_PID_FILE")"
+
+  # 避免 PID 被复用后终止不属于本脚本的进程。
+  if [ -r "/proc/${STOP_PID}/cmdline" ]; then
+    STOP_CMDLINE="$(
+      tr '\000' ' ' <"/proc/${STOP_PID}/cmdline" 2>/dev/null ||
+        true
+    )"
+
+    if [ -n "$STOP_CMDLINE" ]; then
+      case "$STOP_CMDLINE" in
+        *"$STOP_EXPECTED_BIN"*)
+          ;;
+        *)
+          rm -f "$STOP_PID_FILE"
+          return 0
+          ;;
+      esac
+    fi
+  fi
+
   kill "$STOP_PID" 2>/dev/null || true
 
   STOP_COUNT=0
@@ -297,17 +310,39 @@ stop_all() {
 }
 
 show_status() {
-  if pid_running "$SB_PID_FILE" "$SB_BIN"; then
+  if pid_alive "$SB_PID_FILE"; then
     say "sing-box:    running, PID $(cat "$SB_PID_FILE")"
   else
     say "sing-box:    stopped"
   fi
 
-  if pid_running "$CF_PID_FILE" "$CF_BIN"; then
+  if pid_alive "$CF_PID_FILE"; then
     say "cloudflared: running, PID $(cat "$CF_PID_FILE")"
   else
     say "cloudflared: stopped"
   fi
+}
+
+remove_cron() {
+  command -v crontab >/dev/null 2>&1 || return 0
+
+  {
+    crontab -l 2>/dev/null |
+      grep -Fv "${MANAGER} start" || true
+  } | crontab - 2>/dev/null || true
+}
+
+add_cron() {
+  [ "$ENABLE_CRON" = "true" ] || return 0
+  command -v crontab >/dev/null 2>&1 || return 0
+
+  CRON_LINE="@reboot sleep 20 && ${MANAGER} start >>${LOG_DIR}/boot.log 2>&1"
+
+  {
+    crontab -l 2>/dev/null |
+      grep -Fv "${MANAGER} start" || true
+    printf '%s\n' "$CRON_LINE"
+  } | crontab - 2>/dev/null || true
 }
 
 install_manager() {
@@ -319,7 +354,7 @@ install_manager() {
   download_file "$SELF_URL" "$MANAGER_SOURCE" ||
     die "无法从 GitHub 下载管理脚本"
 
-  # 自动清除 GitHub 文件中可能存在的 CRLF。
+  # 即使 GitHub 文件意外为 CRLF，安装到服务器时也转换为 LF。
   tr -d '\r' <"$MANAGER_SOURCE" >"$MANAGER_NEW"
 
   chmod 700 "$MANAGER_NEW"
@@ -359,9 +394,6 @@ download_sing_box() {
   chmod 700 "$SB_NEW"
   mv "$SB_NEW" "$SB_BIN"
   rm -f "$SB_ARCHIVE"
-
-  "$SB_BIN" version >/dev/null 2>&1 ||
-    die "sing-box 二进制无法运行，可能与当前系统不兼容"
 }
 
 download_cloudflared() {
@@ -383,9 +415,28 @@ download_cloudflared() {
 
   chmod 700 "$CF_NEW"
   mv "$CF_NEW" "$CF_BIN"
+}
 
-  "$CF_BIN" --version >/dev/null 2>&1 ||
-    die "cloudflared 二进制无法运行，可能与当前系统不兼容"
+check_binaries() {
+  SB_CHECK_OUTPUT="$("$SB_BIN" version 2>&1)" || {
+    printf '%s\n' "$SB_CHECK_OUTPUT" >&2
+
+    if [ -f /etc/alpine-release ]; then
+      die "sing-box 无法运行。当前 Alpine 可能未预装 gcompat；本脚本不会使用 root 权限安装系统软件，请联系服务商或改用 Debian/Ubuntu"
+    fi
+
+    die "sing-box 二进制无法在当前系统运行"
+  }
+
+  CF_CHECK_OUTPUT="$("$CF_BIN" --version 2>&1)" || {
+    printf '%s\n' "$CF_CHECK_OUTPUT" >&2
+
+    if [ -f /etc/alpine-release ]; then
+      die "cloudflared 无法运行。请确认 Alpine 已预装所需兼容环境"
+    fi
+
+    die "cloudflared 二进制无法在当前系统运行"
+  }
 }
 
 create_identity() {
@@ -480,7 +531,7 @@ start_sing_box() {
 
   sleep 2
 
-  if ! pid_running "$SB_PID_FILE" "$SB_BIN"; then
+  if ! pid_alive "$SB_PID_FILE"; then
     tail -n 40 "$SB_LOG" >&2 || true
     die "sing-box 启动失败，可能是配置错误或内存不足"
   fi
@@ -510,10 +561,6 @@ wait_for_domain() {
   DOMAIN_COUNT=0
 
   while [ "$DOMAIN_COUNT" -lt 120 ]; do
-    if ! pid_running "$CF_PID_FILE" "$CF_BIN"; then
-      return 1
-    fi
-
     DOMAIN_CANDIDATE="$(
       grep -Eo \
         'https://[A-Za-z0-9-]+\.trycloudflare\.com' \
@@ -529,6 +576,12 @@ wait_for_domain() {
         ;;
     esac
 
+    # Alpine 后台进程启动可能稍慢，前 5 秒不判断退出。
+    if [ "$DOMAIN_COUNT" -ge 5 ] &&
+       ! pid_alive "$CF_PID_FILE"; then
+      return 1
+    fi
+
     DOMAIN_COUNT=$((DOMAIN_COUNT + 1))
     sleep 1
   done
@@ -543,7 +596,7 @@ create_node() {
     *.trycloudflare.com)
       ;;
     *)
-      die "拒绝使用空域名或无效域名生成节点"
+      die "拒绝使用空域名或无效临时域名生成节点"
       ;;
   esac
 
@@ -581,28 +634,6 @@ EOF
   chmod 600 "$DOMAIN_FILE" "$NODE_FILE" "$SUB_FILE"
 }
 
-remove_cron() {
-  command -v crontab >/dev/null 2>&1 || return 0
-
-  {
-    crontab -l 2>/dev/null |
-      grep -Fv "${MANAGER} start" || true
-  } | crontab - 2>/dev/null || true
-}
-
-add_cron() {
-  [ "$ENABLE_CRON" = "true" ] || return 0
-  command -v crontab >/dev/null 2>&1 || return 0
-
-  CRON_LINE="@reboot sleep 20 && ${MANAGER} start >>${LOG_DIR}/boot.log 2>&1"
-
-  {
-    crontab -l 2>/dev/null |
-      grep -Fv "${MANAGER} start" || true
-    printf '%s\n' "$CRON_LINE"
-  } | crontab - 2>/dev/null || true
-}
-
 case "$ACTION" in
   stop)
     stop_all
@@ -638,20 +669,10 @@ case "$ACTION" in
     ;;
 esac
 
-command -v tar >/dev/null 2>&1 ||
-  die "系统缺少 tar 命令"
-
-command -v base64 >/dev/null 2>&1 ||
-  die "系统缺少 base64 命令"
-
-command -v grep >/dev/null 2>&1 ||
-  die "系统缺少 grep 命令"
-
-command -v sed >/dev/null 2>&1 ||
-  die "系统缺少 sed 命令"
-
-command -v tr >/dev/null 2>&1 ||
-  die "系统缺少 tr 命令"
+for REQUIRED_COMMAND in tar base64 grep sed tr; do
+  command -v "$REQUIRED_COMMAND" >/dev/null 2>&1 ||
+    die "系统缺少命令: ${REQUIRED_COMMAND}"
+done
 
 choose_local_port
 validate_settings
@@ -672,6 +693,8 @@ else
   download_cloudflared false
 fi
 
+check_binaries
+
 if [ "$ACTION" = "rotate" ]; then
   stop_all
   rm -f "$UUID_FILE" "$WS_PATH_FILE"
@@ -681,14 +704,11 @@ create_identity
 write_sing_box_config
 
 if [ "$ACTION" = "start" ] &&
-   pid_running "$SB_PID_FILE" "$SB_BIN" &&
-   pid_running "$CF_PID_FILE" "$CF_BIN"; then
+   pid_alive "$SB_PID_FILE" &&
+   pid_alive "$CF_PID_FILE" &&
+   [ -s "$NODE_FILE" ]; then
   show_status
-
-  if [ -s "$NODE_FILE" ]; then
-    cat "$NODE_FILE"
-  fi
-
+  cat "$NODE_FILE"
   exit 0
 fi
 
@@ -697,6 +717,9 @@ rm -f "$DOMAIN_FILE" "$NODE_FILE"
 
 start_sing_box
 start_cloudflared
+
+# 避免 Alpine 在 cloudflared 完成 exec 前立即检测进程。
+sleep 2
 
 DOMAIN=""
 
@@ -716,7 +739,7 @@ case "$DOMAIN" in
     ;;
 esac
 
-if ! pid_running "$SB_PID_FILE" "$SB_BIN"; then
+if ! pid_alive "$SB_PID_FILE"; then
   tail -n 40 "$SB_LOG" >&2 || true
   stop_all
   die "sing-box 已退出，可能是内存不足"
