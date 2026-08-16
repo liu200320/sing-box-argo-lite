@@ -5,7 +5,58 @@
 脚本使用 Cloudflare Quick Tunnel 自动生成临时 `trycloudflare.com` 域名，不需要自己的域名、TLS 证书、Nginx 或 systemd。
 
 ## 一键安装
+## 交互式端口选择
 
+运行一键安装命令后，脚本会询问：
+
+```text
+请输入 sing-box 本地回源端口 [默认 40001]:
+```
+
+如果 NAT 映射是：
+
+```text
+40001:40001
+```
+
+输入：
+
+```text
+40001
+```
+
+也可以直接按回车使用默认端口。
+
+如果外部端口和内部端口不同，例如：
+
+```text
+50001:40001
+```
+
+应输入右侧的内部端口：
+
+```text
+40001
+```
+
+端口会保存到：
+
+```text
+~/.config/sb-argo/local-port
+```
+
+执行 `restart`、`update` 或服务器重启时，会继续使用保存的端口，不会再次询问。
+
+也可以使用环境变量跳过交互：
+
+```bash
+wget -qO- \
+  https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh \
+  | tr -d '\r' \
+  | LOCAL_PORT=40002 bash
+```
+
+注意：Cloudflare 临时隧道模式下，v2rayN 仍然连接临时域名的 `443` 端口。这里输入的端口只用于服务器本地回源。
 推荐使用下面的命令。命令中的 `tr` 可以兼容意外出现的 Windows CRLF 换行：
 
 ```bash
