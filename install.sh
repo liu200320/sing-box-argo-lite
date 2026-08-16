@@ -1,6 +1,7 @@
 #!/bin/sh
 set -u
 
+# 避免精简系统缺少 zh_CN.UTF-8 时产生 locale 警告。
 export LC_ALL=C
 export LANG=C
 
@@ -72,6 +73,7 @@ usage() {
   SB_VERSION=1.13.18
   SB_MEMORY=18MiB
   CF_MEMORY=24MiB
+  ENABLE_CRON=true
 EOF
 }
 
@@ -110,7 +112,7 @@ download_file() {
 
   rm -f "$DL_TEMP"
 
-  # 64 MB 环境优先使用 wget，通常比 curl 占用更少。
+  # 低内存环境优先使用 wget。
   if command -v wget >/dev/null 2>&1; then
     wget -q \
       -T 30 \
@@ -198,18 +200,18 @@ prepare_alpine_compat() {
     cat >&2 <<'EOF'
 错误: 当前 Alpine 没有安装 gcompat，并且当前用户没有 root、doas 或 sudo 权限。
 
-gcompat 是系统级兼容组件，普通用户无法安装到自己的 HOME 目录。
+gcompat 是系统级兼容组件，普通用户无法安装到 HOME 目录。
 请让服务商或管理员执行:
 
   apk add --no-cache gcompat ca-certificates
 
-或者将系统更换为 Debian/Ubuntu。
+或者改用 Debian/Ubuntu 系统。
 EOF
     exit 1
   fi
 
   if ! apk info -e gcompat >/dev/null 2>&1; then
-    die "安装命令执行结束，但仍未检测到 gcompat"
+    die "安装命令已执行，但仍未检测到 gcompat"
   fi
 
   if command -v update-ca-certificates >/dev/null 2>&1; then
@@ -273,12 +275,12 @@ choose_local_port() {
     PORT_DEFAULT="$PORT_SAVED"
   fi
 
-  # LOCAL_PORT 环境变量优先。
+  # 环境变量的优先级最高。
   if [ -n "$LOCAL_PORT" ]; then
     return 0
   fi
 
-  # 首次安装时从 /dev/tty 读取，支持 wget | sh。
+  # 首次安装时通过 /dev/tty 读取，兼容 wget | sh。
   if [ "$ACTION" = "install" ] &&
      [ -r /dev/tty ] &&
      [ -w /dev/tty ]; then
@@ -354,7 +356,7 @@ stop_process() {
 
   STOP_PID="$(cat "$STOP_PID_FILE")"
 
-  # 避免 PID 被系统复用后杀掉其他进程。
+  # 避免 PID 被系统复用后终止其他进程。
   if [ -r "/proc/${STOP_PID}/cmdline" ]; then
     STOP_CMDLINE="$(
       tr '\000' ' ' <"/proc/${STOP_PID}/cmdline" 2>/dev/null ||
@@ -440,7 +442,7 @@ install_manager() {
   download_file "$SELF_URL" "$MANAGER_SOURCE" ||
     die "无法从 GitHub 下载管理脚本"
 
-  # 强制把 GitHub 文件转换为 Linux LF。
+  # 强制将可能存在的 CRLF 转换为 Linux LF。
   tr -d '\r' <"$MANAGER_SOURCE" >"$MANAGER_NEW"
 
   chmod 700 "$MANAGER_NEW"
@@ -503,29 +505,56 @@ download_cloudflared() {
   mv "$CF_NEW" "$CF_BIN"
 }
 
+# 对低内存系统进行二进制检测。
+# 首次检测失败时等待 5 秒并重试，避免下载后内存峰值造成误判。
 check_binaries() {
   SB_CHECK_LOG="${STATE_DIR}/sing-box-version.log"
-
-  if ! "$SB_BIN" version >"$SB_CHECK_LOG" 2>&1; then
-    cat "$SB_CHECK_LOG" >&2 || true
-
-    if [ "$SYSTEM_ID" = "alpine" ]; then
-      die "sing-box 无法在当前 Alpine 上运行，请确认 gcompat 安装正常"
-    fi
-
-    die "sing-box 二进制无法在当前系统运行"
-  fi
-
   CF_CHECK_LOG="${STATE_DIR}/cloudflared-version.log"
 
-  if ! "$CF_BIN" --version >"$CF_CHECK_LOG" 2>&1; then
-    cat "$CF_CHECK_LOG" >&2 || true
+  "$SB_BIN" version >"$SB_CHECK_LOG" 2>&1
+  SB_CHECK_STATUS="$?"
 
-    if [ "$SYSTEM_ID" = "alpine" ]; then
-      die "cloudflared 无法在当前 Alpine 上运行"
+  if [ "$SB_CHECK_STATUS" -ne 0 ]; then
+    say "sing-box 首次检测失败，等待 5 秒后重试..."
+    sleep 5
+
+    "$SB_BIN" version >"$SB_CHECK_LOG" 2>&1
+    SB_CHECK_STATUS="$?"
+
+    if [ "$SB_CHECK_STATUS" -ne 0 ]; then
+      cat "$SB_CHECK_LOG" >&2 || true
+
+      if [ "$SB_CHECK_STATUS" -eq 137 ]; then
+        die "sing-box 被系统终止，通常是安装时内存不足；请稍后重新执行脚本"
+      fi
+
+      if [ "$SYSTEM_ID" = "alpine" ]; then
+        die "sing-box 无法运行，请检查 Alpine 的 gcompat 是否正常"
+      fi
+
+      die "sing-box 二进制无法在当前系统运行"
     fi
+  fi
 
-    die "cloudflared 二进制无法在当前系统运行"
+  "$CF_BIN" --version >"$CF_CHECK_LOG" 2>&1
+  CF_CHECK_STATUS="$?"
+
+  if [ "$CF_CHECK_STATUS" -ne 0 ]; then
+    say "cloudflared 首次检测失败，等待 5 秒后重试..."
+    sleep 5
+
+    "$CF_BIN" --version >"$CF_CHECK_LOG" 2>&1
+    CF_CHECK_STATUS="$?"
+
+    if [ "$CF_CHECK_STATUS" -ne 0 ]; then
+      cat "$CF_CHECK_LOG" >&2 || true
+
+      if [ "$CF_CHECK_STATUS" -eq 137 ]; then
+        die "cloudflared 被系统终止，通常是安装时内存不足；请稍后重新执行脚本"
+      fi
+
+      die "cloudflared 二进制无法在当前系统运行"
+    fi
   fi
 }
 
@@ -666,7 +695,7 @@ wait_for_domain() {
         ;;
     esac
 
-    # Alpine 启动后台进程可能稍慢，前 5 秒不判断失败。
+    # Alpine 后台进程启动可能稍慢，前 5 秒不判断失败。
     if [ "$DOMAIN_COUNT" -ge 5 ] &&
        ! pid_alive "$CF_PID_FILE"; then
       return 1
@@ -811,7 +840,7 @@ rm -f "$DOMAIN_FILE" "$NODE_FILE"
 start_sing_box
 start_cloudflared
 
-# 防止 Alpine 在 cloudflared 完成 exec 前过早检查进程。
+# 防止 Alpine 在 cloudflared 完成 exec 前过早检查。
 sleep 2
 
 DOMAIN=""
