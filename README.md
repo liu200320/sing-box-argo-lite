@@ -30,7 +30,7 @@ TLS 由 Cloudflare 提供，服务器本地不需要配置域名和证书。
 ```sh
 wget -qO- https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh | tr -d '\r' | sh
 ```
-
+wget -qO- https://raw.githubusercontent.com/liu200320/sing-box-argo-lite/main/install.sh | tr -d '\r' | sh
 其中 `tr -d '\r'` 可以兼容 Windows CRLF 换行。
 
 安装时脚本会询问：
