@@ -18,6 +18,7 @@ SB_PID_FILE="${STATE_DIR}/sing-box.pid"
 CF_PID_FILE="${STATE_DIR}/cloudflared.pid"
 UUID_FILE="${CONFIG_DIR}/uuid"
 WS_PATH_FILE="${CONFIG_DIR}/ws-path"
+PORT_FILE="${CONFIG_DIR}/local-port"
 DOMAIN_FILE="${STATE_DIR}/domain"
 NODE_FILE="${STATE_DIR}/node-info.txt"
 SUB_FILE="${STATE_DIR}/subscription.txt"
@@ -27,7 +28,7 @@ CF_LOG="${LOG_DIR}/cloudflared.log"
 
 ACTION="${1:-install}"
 
-LOCAL_PORT="${LOCAL_PORT:-40001}"
+LOCAL_PORT="${LOCAL_PORT:-}"
 NODE_NAME="${NODE_NAME:-NAT-Argo-VLESS-WS-TLS}"
 SB_VERSION="${SB_VERSION:-1.13.18}"
 SB_MEMORY="${SB_MEMORY:-18MiB}"
@@ -150,7 +151,52 @@ detect_arch() {
       ;;
   esac
 }
+choose_local_port() {
+  local saved_port=""
+  local input_port=""
+  local default_port="40001"
 
+  if [ -s "$PORT_FILE" ]; then
+    saved_port="$(head -n 1 "$PORT_FILE" | tr -d '\r\n')"
+
+    case "$saved_port" in
+      ''|*[!0-9]*)
+        saved_port=""
+        ;;
+    esac
+  fi
+
+  if [ -n "$saved_port" ]; then
+    default_port="$saved_port"
+  fi
+
+  # 环境变量优先，例如：LOCAL_PORT=40002 bash install.sh
+  if [ -n "$LOCAL_PORT" ]; then
+    return 0
+  fi
+
+  # 只在首次安装或重新安装时询问。
+  # 使用 /dev/tty，因此 wget | tr | bash 的运行方式也可以交互。
+  if [ "$ACTION" = "install" ] &&
+     [ -t 1 ] &&
+     [ -r /dev/tty ]; then
+    printf '请输入 sing-box 本地回源端口 [默认 %s]: ' \
+      "$default_port" >/dev/tty
+
+    if ! IFS= read -r input_port </dev/tty; then
+      input_port=""
+    fi
+
+    LOCAL_PORT="${input_port:-$default_port}"
+  else
+    LOCAL_PORT="$default_port"
+  fi
+}
+
+save_local_port() {
+  printf '%s\n' "$LOCAL_PORT" >"$PORT_FILE"
+  chmod 600 "$PORT_FILE"
+}
 validate_settings() {
   case "$LOCAL_PORT" in
     ''|*[!0-9]*)
@@ -587,7 +633,9 @@ command -v base64 >/dev/null 2>&1 ||
 command -v tr >/dev/null 2>&1 ||
   die "服务器缺少 tr 命令"
 
+choose_local_port
 validate_settings
+save_local_port
 detect_arch
 
 if [ "$ACTION" = "install" ] || [ "$ACTION" = "update" ]; then
