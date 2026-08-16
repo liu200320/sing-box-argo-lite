@@ -1,7 +1,6 @@
 #!/bin/sh
 set -u
 
-# 使用基础 C locale，避免精简系统缺少 zh_CN.UTF-8。
 export LC_ALL=C
 export LANG=C
 
@@ -20,6 +19,7 @@ SB_CONFIG="${CONFIG_DIR}/sing-box.json"
 
 SB_PID_FILE="${STATE_DIR}/sing-box.pid"
 CF_PID_FILE="${STATE_DIR}/cloudflared.pid"
+
 UUID_FILE="${CONFIG_DIR}/uuid"
 WS_PATH_FILE="${CONFIG_DIR}/ws-path"
 PORT_FILE="${CONFIG_DIR}/local-port"
@@ -39,6 +39,7 @@ NODE_NAME="${NODE_NAME:-NAT-Argo-VLESS-WS-TLS}"
 SB_VERSION="${SB_VERSION:-1.13.18}"
 SB_MEMORY="${SB_MEMORY:-18MiB}"
 CF_MEMORY="${CF_MEMORY:-24MiB}"
+
 ENABLE_CRON="${ENABLE_CRON:-true}"
 GH_PROXY="${GH_PROXY:-}"
 
@@ -109,7 +110,7 @@ download_file() {
 
   rm -f "$DL_TEMP"
 
-  # 极低内存环境优先使用 wget。
+  # 64 MB 环境优先使用 wget，通常比 curl 占用更少。
   if command -v wget >/dev/null 2>&1; then
     wget -q \
       -T 30 \
@@ -141,6 +142,89 @@ download_file() {
   mv "$DL_TEMP" "$DL_OUTPUT"
 }
 
+detect_system() {
+  SYSTEM_ID="unknown"
+  SYSTEM_NAME="Unknown Linux"
+
+  if [ -r /etc/os-release ]; then
+    SYSTEM_ID="$(
+      sed -n 's/^ID=//p' /etc/os-release |
+        head -n 1 |
+        tr -d '"'
+    )"
+
+    SYSTEM_NAME="$(
+      sed -n 's/^PRETTY_NAME=//p' /etc/os-release |
+        head -n 1 |
+        sed 's/^"//;s/"$//'
+    )"
+  elif [ -f /etc/alpine-release ]; then
+    SYSTEM_ID="alpine"
+    SYSTEM_NAME="Alpine Linux"
+  elif [ -f /etc/debian_version ]; then
+    SYSTEM_ID="debian"
+    SYSTEM_NAME="Debian Linux"
+  fi
+
+  [ -n "$SYSTEM_ID" ] || SYSTEM_ID="unknown"
+  [ -n "$SYSTEM_NAME" ] || SYSTEM_NAME="$SYSTEM_ID"
+
+  say "检测到系统: ${SYSTEM_NAME}"
+}
+
+prepare_alpine_compat() {
+  [ "$SYSTEM_ID" = "alpine" ] || return 0
+
+  command -v apk >/dev/null 2>&1 ||
+    die "检测到 Alpine，但系统中没有 apk 命令"
+
+  if apk info -e gcompat >/dev/null 2>&1; then
+    say "Alpine gcompat 已安装，继续下一步。"
+    return 0
+  fi
+
+  say "检测到 Alpine 未安装 gcompat，正在尝试安装..."
+
+  if [ "$(id -u)" -eq 0 ]; then
+    apk add --no-cache gcompat ca-certificates ||
+      die "gcompat 安装失败"
+  elif command -v doas >/dev/null 2>&1; then
+    doas apk add --no-cache gcompat ca-certificates ||
+      die "无法通过 doas 安装 gcompat"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo apk add --no-cache gcompat ca-certificates ||
+      die "无法通过 sudo 安装 gcompat"
+  else
+    cat >&2 <<'EOF'
+错误: 当前 Alpine 没有安装 gcompat，并且当前用户没有 root、doas 或 sudo 权限。
+
+gcompat 是系统级兼容组件，普通用户无法安装到自己的 HOME 目录。
+请让服务商或管理员执行:
+
+  apk add --no-cache gcompat ca-certificates
+
+或者将系统更换为 Debian/Ubuntu。
+EOF
+    exit 1
+  fi
+
+  if ! apk info -e gcompat >/dev/null 2>&1; then
+    die "安装命令执行结束，但仍未检测到 gcompat"
+  fi
+
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    if [ "$(id -u)" -eq 0 ]; then
+      update-ca-certificates >/dev/null 2>&1 || true
+    elif command -v doas >/dev/null 2>&1; then
+      doas update-ca-certificates >/dev/null 2>&1 || true
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo update-ca-certificates >/dev/null 2>&1 || true
+    fi
+  fi
+
+  say "Alpine gcompat 安装完成。"
+}
+
 detect_arch() {
   case "$(uname -m)" in
     x86_64|amd64)
@@ -163,6 +247,8 @@ detect_arch() {
       die "不支持的 CPU 架构: $(uname -m)"
       ;;
   esac
+
+  say "检测到架构: $(uname -m)"
 }
 
 choose_local_port() {
@@ -187,12 +273,12 @@ choose_local_port() {
     PORT_DEFAULT="$PORT_SAVED"
   fi
 
-  # 环境变量优先。
+  # LOCAL_PORT 环境变量优先。
   if [ -n "$LOCAL_PORT" ]; then
     return 0
   fi
 
-  # 首次安装时通过 /dev/tty 交互读取，支持 wget | sh。
+  # 首次安装时从 /dev/tty 读取，支持 wget | sh。
   if [ "$ACTION" = "install" ] &&
      [ -r /dev/tty ] &&
      [ -w /dev/tty ]; then
@@ -268,7 +354,7 @@ stop_process() {
 
   STOP_PID="$(cat "$STOP_PID_FILE")"
 
-  # 避免 PID 被复用后终止不属于本脚本的进程。
+  # 避免 PID 被系统复用后杀掉其他进程。
   if [ -r "/proc/${STOP_PID}/cmdline" ]; then
     STOP_CMDLINE="$(
       tr '\000' ' ' <"/proc/${STOP_PID}/cmdline" 2>/dev/null ||
@@ -354,7 +440,7 @@ install_manager() {
   download_file "$SELF_URL" "$MANAGER_SOURCE" ||
     die "无法从 GitHub 下载管理脚本"
 
-  # 即使 GitHub 文件意外为 CRLF，安装到服务器时也转换为 LF。
+  # 强制把 GitHub 文件转换为 Linux LF。
   tr -d '\r' <"$MANAGER_SOURCE" >"$MANAGER_NEW"
 
   chmod 700 "$MANAGER_NEW"
@@ -418,25 +504,29 @@ download_cloudflared() {
 }
 
 check_binaries() {
-  SB_CHECK_OUTPUT="$("$SB_BIN" version 2>&1)" || {
-    printf '%s\n' "$SB_CHECK_OUTPUT" >&2
+  SB_CHECK_LOG="${STATE_DIR}/sing-box-version.log"
 
-    if [ -f /etc/alpine-release ]; then
-      die "sing-box 无法运行。当前 Alpine 可能未预装 gcompat；本脚本不会使用 root 权限安装系统软件，请联系服务商或改用 Debian/Ubuntu"
+  if ! "$SB_BIN" version >"$SB_CHECK_LOG" 2>&1; then
+    cat "$SB_CHECK_LOG" >&2 || true
+
+    if [ "$SYSTEM_ID" = "alpine" ]; then
+      die "sing-box 无法在当前 Alpine 上运行，请确认 gcompat 安装正常"
     fi
 
     die "sing-box 二进制无法在当前系统运行"
-  }
+  fi
 
-  CF_CHECK_OUTPUT="$("$CF_BIN" --version 2>&1)" || {
-    printf '%s\n' "$CF_CHECK_OUTPUT" >&2
+  CF_CHECK_LOG="${STATE_DIR}/cloudflared-version.log"
 
-    if [ -f /etc/alpine-release ]; then
-      die "cloudflared 无法运行。请确认 Alpine 已预装所需兼容环境"
+  if ! "$CF_BIN" --version >"$CF_CHECK_LOG" 2>&1; then
+    cat "$CF_CHECK_LOG" >&2 || true
+
+    if [ "$SYSTEM_ID" = "alpine" ]; then
+      die "cloudflared 无法在当前 Alpine 上运行"
     fi
 
     die "cloudflared 二进制无法在当前系统运行"
-  }
+  fi
 }
 
 create_identity() {
@@ -576,7 +666,7 @@ wait_for_domain() {
         ;;
     esac
 
-    # Alpine 后台进程启动可能稍慢，前 5 秒不判断退出。
+    # Alpine 启动后台进程可能稍慢，前 5 秒不判断失败。
     if [ "$DOMAIN_COUNT" -ge 5 ] &&
        ! pid_alive "$CF_PID_FILE"; then
       return 1
@@ -602,7 +692,7 @@ create_node() {
 
   ENCODED_PATH="%2F${WS_PATH#/}"
 
-  VLESS_LINK="vless://${UUID}@${NODE_DOMAIN}:443?encryption=none&security=tls&sni=${NODE_DOMAIN}&alpn=http%2F1.1&type=ws&host=${NODE_DOMAIN}&path=${ENCODED_PATH}#${NODE_NAME}"
+  VLESS_LINK="vless://${UUID}@${NODE_DOMAIN}:443?encryption=none&security=tls&sni=${NODE_DOMAIN}&type=ws&host=${NODE_DOMAIN}&path=${ENCODED_PATH}#${NODE_NAME}"
 
   printf '%s\n' "$NODE_DOMAIN" >"$DOMAIN_FILE"
 
@@ -669,7 +759,8 @@ case "$ACTION" in
     ;;
 esac
 
-for REQUIRED_COMMAND in tar base64 grep sed tr; do
+for REQUIRED_COMMAND in \
+  tar base64 grep sed tr head tail nohup env id uname; do
   command -v "$REQUIRED_COMMAND" >/dev/null 2>&1 ||
     die "系统缺少命令: ${REQUIRED_COMMAND}"
 done
@@ -677,7 +768,9 @@ done
 choose_local_port
 validate_settings
 save_local_port
+detect_system
 detect_arch
+prepare_alpine_compat
 
 if [ "$ACTION" = "install" ] ||
    [ "$ACTION" = "update" ]; then
@@ -718,7 +811,7 @@ rm -f "$DOMAIN_FILE" "$NODE_FILE"
 start_sing_box
 start_cloudflared
 
-# 避免 Alpine 在 cloudflared 完成 exec 前立即检测进程。
+# 防止 Alpine 在 cloudflared 完成 exec 前过早检查进程。
 sleep 2
 
 DOMAIN=""
@@ -744,6 +837,9 @@ if ! pid_alive "$SB_PID_FILE"; then
   stop_all
   die "sing-box 已退出，可能是内存不足"
 fi
+
+# Quick Tunnel 域名刚创建时可能需要短暂传播时间。
+sleep 5
 
 create_node "$DOMAIN"
 add_cron
